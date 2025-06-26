@@ -1,0 +1,66 @@
+# docker-compose.full.yml - 헬스체크 개선 버전
+services:
+  ollama:
+    build:
+      context: ./ollama
+      dockerfile: Dockerfile
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/models_ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:6333/health || curl -f http://localhost:6333/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  rag-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag-app
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./app.py:/app/app.py
+      - ./service_account.json:/app/service_account.json
+    depends_on:
+      ollama:
+        condition: service_started  # healthy 대신 started로 변경
+      qdrant:
+        condition: service_started  # healthy 대신 started로 변경
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - GOOGLE_DRIVE_FOLDER_ID=1j-IWG6JWndIa6yGSbChPH-k_jkoQ4OjZ
+      - SYNC_INTERVAL_MINUTES=30
+    restart: unless-stopped
+
+volumes:
+  ollama_data:
+  qdrant_storage:
+
+networks:
+  default:
+    name: ai-project_default
+    driver: bridge

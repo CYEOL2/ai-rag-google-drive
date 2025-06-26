@@ -1,0 +1,25 @@
+# requirements.txt (Corrected Version)
+
+# LangChain 및 핵심 RAG 구성요소
+langchain>=0.1.20
+langchain-community>=0.0.38
+langchain-google-community>=1.0.0
+qdrant-client>=1.7.0
+
+# FastAPI 및 서버 관련
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+
+# Google API 관련
+google-api-python-client>=2.100.0
+google-auth-httplib2>=0.2.0
+google-auth-oauthlib>=1.0.0
+
+# 스케줄러
+apscheduler>=3.10.0
+
+# 엑셀 및 PDF 처리 (pypdf는 선택사항이지만 좋은 관행)
+pandas>=2.0.0
+openpyxl>=3.1.0
+pypdf>=4.0.0
