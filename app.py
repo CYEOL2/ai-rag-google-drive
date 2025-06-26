@@ -46,8 +46,8 @@ SYNC_INTERVAL_MINUTES = int(os.getenv("SYNC_INTERVAL_MINUTES", "60"))
 SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
 
 # RAG 처리 관련 설정
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 100
+CHUNK_SIZE = 500
+CHUNK_OVERLAP = 50
 EMBEDDING_BATCH_SIZE = 128
 
 # --- 3. 전역 변수 ---
@@ -74,11 +74,26 @@ def get_drive_service():
         return None
 
 def _decode_bytes_to_text(content_bytes, file_id):
-    for encoding in ('utf-8', 'cp949'):
-        try: return content_bytes.decode(encoding)
-        except UnicodeDecodeError: continue
-    logger.error(f"파일 인코딩을 해석할 수 없습니다: {file_id}")
-    return None
+    """바이트를 텍스트로 디코딩 (한글 지원 강화)"""
+    # 다양한 인코딩 시도 (한글 지원을 위해 순서 중요)
+    encodings = ['utf-8', 'utf-8-sig', 'cp949', 'euc-kr', 'iso-8859-1', 'latin1']
+    
+    for encoding in encodings:
+        try: 
+            decoded = content_bytes.decode(encoding)
+            logger.info(f"파일 {file_id} 디코딩 성공: {encoding}")
+            return decoded
+        except UnicodeDecodeError: 
+            continue
+    
+    # 모든 인코딩 실패시 오류 복구 시도
+    try:
+        decoded = content_bytes.decode('utf-8', errors='replace')
+        logger.warning(f"파일 {file_id} 디코딩 시 일부 문자 대체됨")
+        return decoded
+    except Exception as e:
+        logger.error(f"파일 인코딩을 해석할 수 없습니다: {file_id}, 오류: {e}")
+        return None
 
 def download_file_content(service, file_id, file_name, mime_type):
     request = None
@@ -101,21 +116,109 @@ def download_file_content(service, file_id, file_name, mime_type):
         file_io.seek(0)
 
         if mime_type in ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'application/vnd.ms-excel']:
-            xls = pd.ExcelFile(file_io, engine='openpyxl')
-            parts = []
-            for sheet in xls.sheet_names:
-                df = pd.read_excel(xls, sheet_name=sheet, dtype=str).dropna(how='all').dropna(axis=1, how='all')
-                if df.empty: continue
-                header = f"--- 시트: {sheet} ---\n"
-                rows = [", ".join(f"{col}: {val}" for col, val in row.dropna().items()) for _, row in df.iterrows()]
-                if content := "\n".join(filter(None, rows)):
-                    parts.append(header + content)
-            return "\n\n".join(parts) if parts else None
+            try:
+                xls = pd.ExcelFile(file_io, engine='openpyxl')
+                parts = []
+                logger.info(f"엑셀 파일 '{file_name}' 처리 시작. 시트 목록: {xls.sheet_names}")
+                
+                for sheet in xls.sheet_names:
+                    # dtype=str로 모든 값을 문자열로 읽고, keep_default_na=False로 NaN 방지
+                    df = pd.read_excel(xls, sheet_name=sheet, dtype=str, keep_default_na=False, na_filter=False)
+                    df = df.dropna(how='all').dropna(axis=1, how='all')
+                    
+                    if df.empty: 
+                        continue
+                    
+                    # 컴럼명 인코딩 문제 해결
+                    df.columns = [fix_filename_encoding(str(col)) for col in df.columns]
+                    
+                    header = f"=== 시트: {fix_filename_encoding(sheet)} ===\n"
+                    
+                    # 각 행을 더 상세하게 처리
+                    rows_content = []
+                    for idx, row in df.iterrows():
+                        # 빈 값이 아닌 셀들만 추출 (공백, nan, None 제외)
+                        non_empty_items = []
+                        for col, val in row.items():
+                            if val and str(val).strip() and str(val).lower() not in ['nan', 'none', '']:
+                                # 값 인코딩 문제 해결
+                                fixed_val = fix_filename_encoding(str(val))
+                                non_empty_items.append(f"{col}: {fixed_val}")
+                        
+                        if non_empty_items:
+                            row_text = " | ".join(non_empty_items)
+                            rows_content.append(row_text)
+                    
+                    if rows_content:
+                        sheet_content = header + "\n".join(rows_content)
+                        parts.append(sheet_content)
+                        logger.info(f"시트 '{sheet}' 처리 완료: {len(rows_content)}행")
+                
+                result = "\n\n".join(parts) if parts else None
+                if result:
+                    logger.info(f"엑셀 파일 '{file_name}' 처리 완료. 총 {len(parts)}개 시트, 길이: {len(result)}자")
+                return result
+                
+            except Exception as excel_error:
+                logger.error(f"엑셀 파일 처리 중 오류 ({file_name}): {excel_error}")
+                return None
 
         return _decode_bytes_to_text(file_io.getvalue(), file_id)
     except Exception as e:
         logger.error(f"파일 다운로드 또는 파싱 실패 ({file_name}): {e}")
         return None
+
+def fix_filename_encoding(file_name):
+    """파일말 인코딩 문제 해결 (강화버전)"""
+    if not file_name:
+        return file_name
+        
+    try:
+        # 1. 이미 올바른 UTF-8 문자열인지 확인
+        try:
+            # 한글 문자가 정상적으로 포함되어 있는지 확인
+            if any('가' <= char <= '힣' for char in file_name):
+                logger.info(f"정상 한글 파일명: {file_name}")
+                return file_name
+        except:
+            pass
+            
+        # 2. 깨진 문자 패턴 감지 및 복구
+        broken_patterns = ['ë', 'ì', 'ê', 'í', 'î', 'ï']
+        if any(pattern in file_name for pattern in broken_patterns):
+            logger.warning(f"깨진 문자 감지: {file_name}")
+            
+            # 다양한 인코딩 복구 시도
+            recovery_attempts = [
+                # Latin-1 -> UTF-8
+                lambda x: x.encode('latin-1').decode('utf-8'),
+                # CP1252 -> UTF-8  
+                lambda x: x.encode('cp1252').decode('utf-8'),
+                # ISO-8859-1 -> UTF-8
+                lambda x: x.encode('iso-8859-1').decode('utf-8'),
+                # Latin-1 -> CP949
+                lambda x: x.encode('latin-1').decode('cp949'),
+                # Latin-1 -> EUC-KR
+                lambda x: x.encode('latin-1').decode('euc-kr')
+            ]
+            
+            for i, attempt in enumerate(recovery_attempts):
+                try:
+                    recovered = attempt(file_name)
+                    # 복구된 문자열에 한글이 있는지 확인
+                    if any('가' <= char <= '힣' for char in recovered):
+                        logger.info(f"파일명 복구 성공 (method {i+1}): {file_name} -> {recovered}")
+                        return recovered
+                except (UnicodeEncodeError, UnicodeDecodeError, LookupError):
+                    continue
+        
+        # 3. 복구 실패 시 원본 반환
+        logger.info(f"인코딩 복구 불필요/실패: {file_name}")
+        return file_name
+        
+    except Exception as e:
+        logger.error(f"파일명 인코딩 복구 중 오류: {e}")
+        return file_name
 
 def get_files_from_drive(folder_id):
     service = get_drive_service()
@@ -125,9 +228,22 @@ def get_files_from_drive(folder_id):
         results = service.files().list(q=query, fields="files(id, name, modifiedTime, mimeType)", pageSize=1000).execute()
         docs = []
         for file in results.get('files', []):
-            if content := download_file_content(service, file['id'], file['name'], file['mimeType']):
-                docs.append({'id': file['id'], 'name': file['name'], 'content': content, 'modified_time': file['modifiedTime']})
-                logger.info(f"파일 로드 완료: {file['name']}")
+            file_name = file['name']
+            # 파일명 인코딩 문제 해결
+            file_name = fix_filename_encoding(file_name)
+            
+            logger.info(f"처리할 파일: {file_name} (ID: {file['id']})")
+            
+            if content := download_file_content(service, file['id'], file_name, file['mimeType']):
+                docs.append({
+                    'id': file['id'], 
+                    'name': file_name, 
+                    'content': content, 
+                    'modified_time': file['modifiedTime']
+                })
+                logger.info(f"파일 로드 완료: {file_name}")
+            else:
+                logger.warning(f"파일 로드 실패: {file_name}")
         return docs
     except HttpError as e:
         logger.error(f"Google Drive API 오류: {e}")
@@ -258,8 +374,39 @@ async def lifespan(app: FastAPI):
     # (이하 코드는 동일합니다)
     vectorstore = Qdrant(client=client, collection_name=COLLECTION_NAME, embeddings=embeddings)
     llm = Ollama(model=LLM_MODEL, base_url=OLLAMA_BASE_URL)
-    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={'k': 4})
-    qa_chain = RetrievalQA.from_chain_type(llm=llm, chain_type="stuff", retriever=retriever)
+    retriever = vectorstore.as_retriever(
+        search_type="mmr", 
+        search_kwargs={
+            'k': 10,
+            'fetch_k': 20,
+            'lambda_mult': 0.7
+        }
+    )
+    # 한국어 응답을 위한 커스텀 체인 설정
+    from langchain.prompts import PromptTemplate
+    
+    custom_prompt = PromptTemplate(
+        template="""[지침사항]
+- 반드시 한국어로 답변하세요
+- 제공된 문서에서 정보를 찾아 정확하게 답변하세요
+- 정보가 없으면 "문서에서 관련 정보를 찾을 수 없습니다"라고 한국어로 답변하세요
+
+[문서 내용]
+{context}
+
+[질문]
+{question}
+
+[답변]""",
+        input_variables=["context", "question"]
+    )
+    
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=llm, 
+        chain_type="stuff", 
+        retriever=retriever,
+        chain_type_kwargs={"prompt": custom_prompt}
+    )
     logger.info("RAG 컴포넌트 초기화 완료.")
 
     if not scheduler.running:
@@ -309,6 +456,64 @@ async def health_check():
         "rag_components_initialized": qa_chain is not None,
         "scheduler_running": scheduler.running if scheduler else False
     }
+
+@app.get("/debug/documents")
+async def debug_documents():
+    """저장된 문서들의 정보를 확인"""
+    if not vectorstore:
+        return {"error": "Vectorstore not initialized"}
+    
+    try:
+        client = vectorstore.client
+        # 모든 문서 정보 가져오기
+        points, _ = client.scroll(
+            collection_name=COLLECTION_NAME,
+            limit=50,
+            with_payload=True,
+            with_vectors=False
+        )
+        
+        documents = []
+        for point in points:
+            payload = point.payload
+            documents.append({
+                "source": payload.get("source", "Unknown"),
+                "file_id": payload.get("file_id", "Unknown"),
+                "content_preview": payload.get("page_content", "")[:200] + "..."
+            })
+        
+        return {
+            "total_documents": len(points),
+            "documents": documents
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/debug/search")
+async def debug_search(req: QueryRequest):
+    """검색 결과를 디버그"""
+    if not vectorstore:
+        return {"error": "Vectorstore not initialized"}
+    
+    try:
+        # 직접 벡터 검색 실행
+        docs = vectorstore.similarity_search_with_score(req.question, k=10)
+        
+        results = []
+        for doc, score in docs:
+            results.append({
+                "score": float(score),
+                "source": doc.metadata.get("source", "Unknown"),
+                "content_preview": doc.page_content[:300] + "..."
+            })
+        
+        return {
+            "question": req.question,
+            "search_results": results
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
