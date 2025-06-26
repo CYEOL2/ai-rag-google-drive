@@ -1,12 +1,20 @@
 # AI RAG Project
 
-이 프로젝트는 Ollama, Qdrant, 그리고 RAG 애플리케이션을 Docker로 구성한 시스템입니다.
+이 프로젝트는 **Ollama (llama3.2 모델)**, **Qdrant 벡터 데이터베이스**, 그리고 **RAG 애플리케이션**을 Docker로 구성한 시스템입니다.
+
+## 🤖 AI 모델 정보
+
+- **기본 모델**: llama3.2 (Meta에서 개발한 최신 언어 모델)
+- **자동 설치**: 첫 실행시 자동으로 다운로드 및 설치 (약 5-10분 소요)
+- **용도**: 임베딩 생성 및 질의응답 처리
+- **언어 지원**: 한국어, 영어 등 다국어 지원
 
 ## 🚀 빠른 시작
 
 ### 전제 조건
 1. **Google API 설정 필요** (Google Drive 연동용)
 2. **Docker Desktop 설치 필요**
+3. **충분한 디스크 공간** (llama3.2 모델용 최소 4GB)
 
 ### 설정 단계
 1. **Google API 인증 파일 준비** (아래 설정 가이드 참조)
@@ -26,7 +34,7 @@ scripts\quick-start.bat
 > 
 > - 이미 실행 중인 컨테이너는 그대로 유지
 > - RAG 앱만 새로 빌드하고 시작
-> - 첫 실행시 모델 다운로드 자동 진행
+> - 첫 실행시 llama3.2 모델 다운로드 자동 진행
 
 ## ⚙️ Google Drive API 설정
 
@@ -90,7 +98,7 @@ AI-Project/
 | 구분 | Ollama 직접 호출 | RAG 시스템 호출 |
 |------|------------------|-----------------|
 | **응답 방식** | 일반적인 AI 대화 | 문서 기반 정확한 답변 |
-| **지식 범위** | 모델 학습 데이터만 | 업로드된 문서 + 모델 지식 |
+| **지식 범위** | llama3.2 학습 데이터만 | 업로드된 문서 + llama3.2 지식 |
 | **최신성** | 학습 시점까지만 | 실시간 문서 업데이트 반영 |
 | **정확성** | 일반적 수준 | 특정 도메인에서 높은 정확성 |
 | **사용 목적** | 일반 대화, 창작 | 문서 검색, 정확한 정보 제공 |
@@ -151,14 +159,14 @@ docker exec -it ollama ollama run llama3.2
 #### 🔧 API 호출
 ```bash
 # RAG 질문하기
-curl -X POST http://localhost:8000/ask \
+curl -X POST http://localhost:8000/query \
   -H "Content-Type: application/json" \
   -d '{
     "question": "우리 회사의 휴가 정책은 어떻게 되나요?"
   }'
 
-# 문서 동기화
-curl -X POST http://localhost:8000/sync
+# 수동 문서 동기화
+curl -X POST http://localhost:8000/manual-sync
 
 # 시스템 상태 확인
 curl http://localhost:8000/health
@@ -169,7 +177,7 @@ curl http://localhost:8000/health
 import requests
 
 # RAG 시스템에 질문
-response = requests.post('http://localhost:8000/ask', 
+response = requests.post('http://localhost:8000/query', 
     json={'question': '프로젝트 일정은 언제까지인가요?'})
 print(response.json())
 
@@ -183,34 +191,6 @@ response = requests.post('http://localhost:11434/api/generate',
 print(response.json())
 ```
 
-### 4. 언제 어떤 방법을 사용할까?
-
-#### 🎯 Ollama 직접 호출을 사용하는 경우:
-- **일반적인 AI 대화**가 필요할 때
-- **창작 활동** (시, 소설, 코드 생성 등)
-- **일반 상식** 질문
-- **브레인스토밍**이나 아이디어 생성
-- **프로그래밍 도움** (일반적인 코딩 질문)
-
-```bash
-# 예시: 창작 활동
-docker exec -it ollama ollama run llama3.2
->>> "미래 도시에 대한 SF 소설을 써주세요"
-```
-
-#### 📚 RAG 시스템을 사용하는 경우:
-- **특정 문서**에서 정보를 찾을 때
-- **회사 내부 정책**이나 규정 질문
-- **기술 문서** 검색
-- **정확한 사실** 확인이 필요할 때
-- **최신 업데이트된 정보**가 필요할 때
-
-```
-웹 브라우저: http://localhost:8000
-질문: "우리 회사 보안 정책에서 비밀번호 규칙은 무엇인가요?"
-→ 업로드된 보안 정책 문서에서 정확한 답변 제공
-```
-
 ## 🔧 주요 특징
 
 ### 간편한 실행
@@ -219,7 +199,7 @@ docker exec -it ollama ollama run llama3.2
 - **자동 빌드**: RAG 앱 이미지 자동 빌드 및 업데이트
 
 ### 안정적 운영
-- **분리된 실행**: 모델 다운로드 중 RAG 앱 오류 방지
+- **분리된 실행**: llama3.2 모델 다운로드 중 RAG 앱 오류 방지
 - **헬스체크**: 서비스 준비 상태 자동 확인
 - **PowerShell 호환**: Windows 환경에서 안정적 동작
 
@@ -241,7 +221,7 @@ docker-compose -f docker-compose.full.yml down
 scripts\quick-start.bat
 ```
 
-### 완전 초기화 (모델 재다운로드)
+### 완전 초기화 (llama3.2 모델 재다운로드)
 ```cmd
 # 모든 데이터 삭제 후 재시작
 docker-compose -f docker-compose.full.yml down -v
@@ -273,7 +253,7 @@ AI-Project/
 ├── .gitignore                    # Git 무시 파일
 ├── ollama/
 │   ├── Dockerfile               # Ollama 커스텀 이미지
-│   └── entrypoint.sh            # 모델 자동 다운로드 스크립트
+│   └── entrypoint.sh            # llama3.2 모델 자동 다운로드 스크립트
 └── documents/                   # 문서 저장 폴더
 ```
 
@@ -373,9 +353,9 @@ scripts\quick-start.bat
 ## 📊 시스템 요구사항
 
 - **Docker Desktop**: 최신 버전
-- **메모리**: 최소 8GB RAM 권장
-- **디스크**: 최소 10GB 여유 공간
-- **네트워크**: 모델 다운로드를 위한 안정적인 인터넷 연결
+- **메모리**: 최소 8GB RAM 권장 (llama3.2 모델 실행용)
+- **디스크**: 최소 10GB 여유 공간 (llama3.2 모델 4GB + 기타)
+- **네트워크**: llama3.2 모델 다운로드를 위한 안정적인 인터넷 연결
 - **Google Cloud 계정**: Google Drive API 사용을 위한 서비스 계정
 
 ## 🔐 환경 변수
@@ -386,6 +366,8 @@ RAG 앱에서 사용하는 주요 환경 변수:
 OLLAMA_BASE_URL=http://ollama:11434
 QDRANT_HOST=qdrant
 QDRANT_PORT=6333
+EMBEDDING_MODEL=llama3.2              # 임베딩 생성용 모델
+LLM_MODEL=llama3.2                    # 질의응답용 모델
 GOOGLE_DRIVE_FOLDER_ID=1j-IWG6JWndIa6yGSbChPH-k_jkoQ4OjZ  # 실제 폴더 ID로 변경
 SYNC_INTERVAL_MINUTES=30
 ```
@@ -395,7 +377,7 @@ SYNC_INTERVAL_MINUTES=30
 ## 💡 사용 팁
 
 1. **일상적 사용**: `scripts\quick-start.bat` 하나로 충분
-2. **첫 실행**: 모델 다운로드 시간 고려하여 여유있게 대기
+2. **첫 실행**: llama3.2 모델 다운로드 시간 고려하여 여유있게 대기
 3. **Google Drive 동기화**: 웹 인터페이스에서 동기화 버튼으로 최신 문서 반영
 4. **문제 발생시**: 전체 재시작 → `docker-compose -f docker-compose.full.yml down && scripts\quick-start.bat`
 5. **로그 확인**: 스크립트 실행 후 실시간 로그 보기 옵션 활용
@@ -413,7 +395,7 @@ scripts\quick-start.bat
 ```
 
 **AI 호출 방법:**
-- **일반 대화**: http://localhost:11434 (Ollama 직접)
+- **일반 대화**: http://localhost:11434 (llama3.2 직접 호출)
 - **문서 기반 질답**: http://localhost:8000 (RAG 시스템)
 
 **서비스 중지:**
@@ -421,4 +403,4 @@ scripts\quick-start.bat
 docker-compose -f docker-compose.full.yml down
 ```
 
-이제 Google Drive 연동이 포함된 완전한 RAG 시스템을 하나의 명령어로 실행할 수 있습니다! 🚀
+이제 llama3.2 모델 기반의 완전한 RAG 시스템을 하나의 명령어로 실행할 수 있습니다! 🚀
