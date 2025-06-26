@@ -27,7 +27,6 @@ docker-compose up -d
 ```bash
 # 모델 준비 상태 확인
 docker logs ollama
-# "Ollama가 모든 설정을 마쳤습니다" 메시지 확인
 ```
 
 #### 3단계: RAG 앱 시작
