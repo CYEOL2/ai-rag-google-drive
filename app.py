@@ -1,4 +1,4 @@
-# app.py (Final Version - No changes needed with the correct environment)
+# app.py (Final Corrected Version)
 
 import uvicorn
 import os
@@ -12,10 +12,20 @@ from pydantic import BaseModel, Field
 # LangChain 및 관련 라이브러리
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Qdrant
-from langchain_community.embeddings import OllamaEmbeddings
-from langchain_community.llms import Ollama
 from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
+from langchain_community.embeddings import OllamaEmbeddings
+
+# 대체 import 시도
+try:
+    from langchain_qdrant import Qdrant
+except ImportError:
+    from langchain_community.vectorstores import Qdrant
+    
+try:
+    from langchain_ollama import OllamaLLM
+except ImportError:
+    from langchain_community.llms import Ollama as OllamaLLM
 
 # Google Drive API 관련
 from google.oauth2 import service_account
@@ -45,10 +55,11 @@ GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
 SYNC_INTERVAL_MINUTES = int(os.getenv("SYNC_INTERVAL_MINUTES", "60"))
 SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
 
-# RAG 처리 관련 설정
-CHUNK_SIZE = 500
-CHUNK_OVERLAP = 50
+# RAG 처리 관련 설정 - Excel에 최적화
+CHUNK_SIZE = 2000  # 업무공유 문서 특성상 더 큰 청크
+CHUNK_OVERLAP = 300  # 더 많은 오버랩으로 컨텍스트 보존
 EMBEDDING_BATCH_SIZE = 128
+CHUNK_VERSION = f"{CHUNK_SIZE}_{CHUNK_OVERLAP}_excel_optimized"
 
 # --- 3. 전역 변수 ---
 vectorstore = None
@@ -74,38 +85,25 @@ def get_drive_service():
         return None
 
 def _decode_bytes_to_text(content_bytes, file_id):
-    """바이트를 텍스트로 디코딩 (한글 지원 강화)"""
-    # 다양한 인코딩 시도 (한글 지원을 위해 순서 중요)
     encodings = ['utf-8', 'utf-8-sig', 'cp949', 'euc-kr', 'iso-8859-1', 'latin1']
-    
     for encoding in encodings:
-        try: 
-            decoded = content_bytes.decode(encoding)
-            logger.info(f"파일 {file_id} 디코딩 성공: {encoding}")
-            return decoded
-        except UnicodeDecodeError: 
+        try:
+            return content_bytes.decode(encoding)
+        except UnicodeDecodeError:
             continue
-    
-    # 모든 인코딩 실패시 오류 복구 시도
-    try:
-        decoded = content_bytes.decode('utf-8', errors='replace')
-        logger.warning(f"파일 {file_id} 디코딩 시 일부 문자 대체됨")
-        return decoded
-    except Exception as e:
-        logger.error(f"파일 인코딩을 해석할 수 없습니다: {file_id}, 오류: {e}")
-        return None
+    logger.warning(f"파일 {file_id} 디코딩 실패. 일부 문자 대체됨.")
+    return content_bytes.decode('utf-8', errors='replace')
 
 def download_file_content(service, file_id, file_name, mime_type):
     request = None
     if mime_type == 'application/vnd.google-apps.document':
         request = service.files().export_media(fileId=file_id, mimeType='text/plain')
-    elif mime_type == 'application/vnd.google-apps.spreadsheet':
-        request = service.files().export_media(fileId=file_id, mimeType='text/csv')
     elif mime_type in ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'application/vnd.ms-excel']:
         request = service.files().get_media(fileId=file_id)
     elif mime_type.startswith('text/'):
         request = service.files().get_media(fileId=file_id)
     else:
+        logger.warning(f"지원하지 않는 MIME 타입({mime_type})으로 파일 '{file_name}'을(를) 건너뜁니다.")
         return None
 
     try:
@@ -115,6 +113,7 @@ def download_file_content(service, file_id, file_name, mime_type):
         while not done: _, done = downloader.next_chunk()
         file_io.seek(0)
 
+        # 엑셀 파일인 경우, 업무공유 문서에 특화된 파싱
         if mime_type in ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'application/vnd.ms-excel']:
             try:
                 xls = pd.ExcelFile(file_io, engine='openpyxl')
@@ -122,103 +121,83 @@ def download_file_content(service, file_id, file_name, mime_type):
                 logger.info(f"엑셀 파일 '{file_name}' 처리 시작. 시트 목록: {xls.sheet_names}")
                 
                 for sheet in xls.sheet_names:
-                    # dtype=str로 모든 값을 문자열로 읽고, keep_default_na=False로 NaN 방지
-                    df = pd.read_excel(xls, sheet_name=sheet, dtype=str, keep_default_na=False, na_filter=False)
-                    df = df.dropna(how='all').dropna(axis=1, how='all')
+                    # 모든 셀을 문자열로 읽고 병합된 셀 정보 유지
+                    df = pd.read_excel(xls, sheet_name=sheet, header=None, dtype=str, keep_default_na=False)
                     
                     if df.empty: 
                         continue
                     
-                    # 컴럼명 인코딩 문제 해결
-                    df.columns = [fix_filename_encoding(str(col)) for col in df.columns]
+                    # 시트 헤더
+                    header = f"\n{'='*60}\n"
+                    header += f"📋 엑셀 시트: {sheet}\n"
+                    header += f"{'='*60}\n\n"
                     
-                    header = f"=== 시트: {fix_filename_encoding(sheet)} ===\n"
+                    # 셀별 상세 정보 추출 (행렬 구조 보존)
+                    content_sections = []
                     
-                    # 각 행을 더 상세하게 처리
-                    rows_content = []
-                    for idx, row in df.iterrows():
-                        # 빈 값이 아닌 셀들만 추출 (공백, nan, None 제외)
-                        non_empty_items = []
-                        for col, val in row.items():
-                            if val and str(val).strip() and str(val).lower() not in ['nan', 'none', '']:
-                                # 값 인코딩 문제 해결
-                                fixed_val = fix_filename_encoding(str(val))
-                                non_empty_items.append(f"{col}: {fixed_val}")
+                    for row_idx, row in df.iterrows():
+                        row_content = []
+                        for col_idx, cell_value in enumerate(row):
+                            if pd.notna(cell_value) and str(cell_value).strip():
+                                clean_val = str(cell_value).strip()
+                                if clean_val and clean_val.lower() not in ['nan', 'none', 'unnamed']:
+                                    row_content.append(f"[{row_idx+1},{col_idx+1}] {clean_val}")
                         
-                        if non_empty_items:
-                            row_text = " | ".join(non_empty_items)
-                            rows_content.append(row_text)
+                        if row_content:
+                            content_sections.append("\n".join(row_content))
                     
-                    if rows_content:
-                        sheet_content = header + "\n".join(rows_content)
-                        parts.append(sheet_content)
-                        logger.info(f"시트 '{sheet}' 처리 완료: {len(rows_content)}행")
+                    # 프로젝트별 상세 정보 추출
+                    all_text = " ".join([str(cell) for row in df.values for cell in row if pd.notna(cell)])
+                    
+                    # 주요 정보 패턴 검색 (범용적)
+                    project_info = "\n🔍 주요 정보:\n"
+                    
+                    # 프로젝트/사업 관련 패턴 검색
+                    import re
+                    project_patterns = re.findall(r'[가-힣\w\s]*(?:프로젝트|사업|시스템|개발|고도화)[가-힣\w\s]*', all_text, re.IGNORECASE)
+                    if project_patterns:
+                        unique_projects = list(set([p.strip() for p in project_patterns if len(p.strip()) > 2]))
+                        project_info += "\n📌 프로젝트/사업:\n"
+                        for pattern in unique_projects[:10]:
+                            project_info += f"  - {pattern}\n"
+                    
+                    # 인력/담당자 관련 패턴 검색
+                    manpower_patterns = re.findall(r'(?:PL|투입|인력|담당)[^\n]*(?:명|개월|년)[^\n]*', all_text, re.IGNORECASE)
+                    if manpower_patterns:
+                        project_info += "\n👥 인력 정보:\n"
+                        for pattern in manpower_patterns:
+                            project_info += f"  - {pattern.strip()}\n"
+                    
+                    # 담당자명 패턴 검색
+                    name_patterns = re.findall(r'[가-힣]{2,4}\s*(?:부장|팀장|연구원|개발자|대리|과장|차장)?', all_text)
+                    if name_patterns:
+                        unique_names = list(set([name.strip() for name in name_patterns if len(name.strip()) >= 2]))
+                        if unique_names:
+                            project_info += f"\n👤 관련 인명: {', '.join(unique_names[:15])}\n"
+                    
+                    # 일정 정보 검색
+                    schedule_patterns = re.findall(r'\d{4}[.-]\d{1,2}[.-]\d{1,2}|\d{1,2}월\s*착수|\d{1,2}개월|\d{4}년\s*\d{1,2}월', all_text)
+                    if schedule_patterns:
+                        project_info += f"\n📅 일정 정보: {', '.join(set(schedule_patterns[:10]))}\n"
+                    
+                    # 최종 컨텐츠 조합
+                    sheet_content = header + "\n".join(content_sections[:50]) + project_info  # 최대 50개 섹션
+                    parts.append(sheet_content)
+                    logger.info(f"시트 '{sheet}' 처리 완료: {len(content_sections)}개 섹션")
                 
                 result = "\n\n".join(parts) if parts else None
                 if result:
                     logger.info(f"엑셀 파일 '{file_name}' 처리 완료. 총 {len(parts)}개 시트, 길이: {len(result)}자")
                 return result
-                
             except Exception as excel_error:
                 logger.error(f"엑셀 파일 처리 중 오류 ({file_name}): {excel_error}")
                 return None
 
+        # 그 외 텍스트 기반 파일 처리
         return _decode_bytes_to_text(file_io.getvalue(), file_id)
     except Exception as e:
         logger.error(f"파일 다운로드 또는 파싱 실패 ({file_name}): {e}")
         return None
-
-def fix_filename_encoding(file_name):
-    """파일말 인코딩 문제 해결 (강화버전)"""
-    if not file_name:
-        return file_name
-        
-    try:
-        # 1. 이미 올바른 UTF-8 문자열인지 확인
-        try:
-            # 한글 문자가 정상적으로 포함되어 있는지 확인
-            if any('가' <= char <= '힣' for char in file_name):
-                logger.info(f"정상 한글 파일명: {file_name}")
-                return file_name
-        except:
-            pass
-            
-        # 2. 깨진 문자 패턴 감지 및 복구
-        broken_patterns = ['ë', 'ì', 'ê', 'í', 'î', 'ï']
-        if any(pattern in file_name for pattern in broken_patterns):
-            logger.warning(f"깨진 문자 감지: {file_name}")
-            
-            # 다양한 인코딩 복구 시도
-            recovery_attempts = [
-                # Latin-1 -> UTF-8
-                lambda x: x.encode('latin-1').decode('utf-8'),
-                # CP1252 -> UTF-8  
-                lambda x: x.encode('cp1252').decode('utf-8'),
-                # ISO-8859-1 -> UTF-8
-                lambda x: x.encode('iso-8859-1').decode('utf-8'),
-                # Latin-1 -> CP949
-                lambda x: x.encode('latin-1').decode('cp949'),
-                # Latin-1 -> EUC-KR
-                lambda x: x.encode('latin-1').decode('euc-kr')
-            ]
-            
-            for i, attempt in enumerate(recovery_attempts):
-                try:
-                    recovered = attempt(file_name)
-                    # 복구된 문자열에 한글이 있는지 확인
-                    if any('가' <= char <= '힣' for char in recovered):
-                        logger.info(f"파일명 복구 성공 (method {i+1}): {file_name} -> {recovered}")
-                        return recovered
-                except (UnicodeEncodeError, UnicodeDecodeError, LookupError):
-                    continue
-        
-        # 3. 복구 실패 시 원본 반환
-        logger.info(f"인코딩 복구 불필요/실패: {file_name}")
-        return file_name
-        
-    except Exception as e:
-        logger.error(f"파일명 인코딩 복구 중 오류: {e}")
-        return file_name
 
 def get_files_from_drive(folder_id):
     service = get_drive_service()
@@ -228,28 +207,16 @@ def get_files_from_drive(folder_id):
         results = service.files().list(q=query, fields="files(id, name, modifiedTime, mimeType)", pageSize=1000).execute()
         docs = []
         for file in results.get('files', []):
-            file_name = file['name']
-            # 파일명 인코딩 문제 해결
-            file_name = fix_filename_encoding(file_name)
-            
-            logger.info(f"처리할 파일: {file_name} (ID: {file['id']})")
-            
-            if content := download_file_content(service, file['id'], file_name, file['mimeType']):
-                docs.append({
-                    'id': file['id'], 
-                    'name': file_name, 
-                    'content': content, 
-                    'modified_time': file['modifiedTime']
-                })
-                logger.info(f"파일 로드 완료: {file_name}")
-            else:
-                logger.warning(f"파일 로드 실패: {file_name}")
+            logger.info(f"처리 대상 파일 발견: {file['name']} (ID: {file['id']})")
+            if content := download_file_content(service, file['id'], file['name'], file['mimeType']):
+                docs.append({'id': file['id'], 'name': file['name'], 'content': content, 'modified_time': file['modifiedTime']})
+                logger.info(f"파일 콘텐츠 로드 완료: {file['name']}")
         return docs
     except HttpError as e:
         logger.error(f"Google Drive API 오류: {e}")
         return []
 
-# --- 5. 동기화 로직 (파일 삭제 처리 기능 포함) ---
+# --- 5. 동기화 로직 (파일 수정일시 기준 중복 방지) ---
 def perform_sync():
     global embeddings, vectorstore
     if not all([embeddings, vectorstore]) or not GOOGLE_DRIVE_FOLDER_ID:
@@ -258,6 +225,8 @@ def perform_sync():
 
     logger.info(f"--- 동기화 시작 (폴더 ID: {GOOGLE_DRIVE_FOLDER_ID}) ---")
     documents = get_files_from_drive(GOOGLE_DRIVE_FOLDER_ID)
+    if not documents:
+        logger.info("동기화할 문서가 없습니다.")
 
     qdrant_client = vectorstore.client
     processed_files, skipped_files = 0, 0
@@ -265,21 +234,38 @@ def perform_sync():
 
     for doc in documents:
         file_id, file_name, modified_time, content = doc['id'], doc['name'], doc['modified_time'], doc['content']
+        
+        # Vector DB에서 해당 파일의 최신 메타데이터 확인
         existing, _ = qdrant_client.scroll(
             collection_name=COLLECTION_NAME, limit=1, with_vectors=False,
             scroll_filter=models.Filter(must=[models.FieldCondition(key="file_id", match=models.MatchValue(value=file_id))]),
-            with_payload=["modified_time"]
+            with_payload=["modified_time", "chunk_version"]
         )
         stored_payload = existing[0].payload if existing else None
-        if stored_payload and stored_payload.get("modified_time") == modified_time:
+        
+        # 조건 확인: 파일 수정일시와 청킹 버전이 모두 동일한 경우 건너뛰기
+        if (stored_payload and
+            stored_payload.get("modified_time") == modified_time and
+            stored_payload.get("chunk_version") == CHUNK_VERSION):
             skipped_files += 1
             continue
-        status = "Update" if stored_payload else "New"
+
+        status = "New"
+        if stored_payload:
+            if stored_payload.get("chunk_version") != CHUNK_VERSION:
+                status = "Update (Chunk Strategy Changed)"
+            else:
+                status = "Update (File Modified)"
+        
         logger.info(f"  - [{status}] 파일 처리 시작: {file_name}")
+        
+        # 파일 내용 분할 (Chunking)
         splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
         chunks = splitter.split_text(content)
-        metadata = {"source": file_name, "file_id": file_id, "modified_time": modified_time}
+        metadata = {"source": file_name, "file_id": file_id, "modified_time": modified_time, "chunk_version": CHUNK_VERSION}
         docs_to_embed = [Document(page_content=t, metadata=metadata) for t in chunks]
+        
+        # 임베딩 및 Vector DB 저장을 위한 데이터 생성
         points, batch_failed = [], False
         for i in range(0, len(docs_to_embed), EMBEDDING_BATCH_SIZE):
             batch = docs_to_embed[i:i + EMBEDDING_BATCH_SIZE]
@@ -290,16 +276,24 @@ def perform_sync():
                     payload = {**doc_chunk.metadata, 'page_content': doc_chunk.page_content}
                     points.append(models.PointStruct(id=pid, vector=vectors[k], payload=payload))
             except Exception as e:
-                logger.error(f"    -> 임베딩 배치 처리 실패 ({file_name}, 시작 인덱스: {i}): {e}")
+                logger.error(f"임베딩 배치 처리 실패 ({file_name}, 시작 인덱스: {i}): {e}")
                 batch_failed = True; break
         if batch_failed: continue
-        if status == "Update":
-            qdrant_client.delete(collection_name=COLLECTION_NAME, points_selector=models.FilterSelector(filter=models.Filter(must=[models.FieldCondition(key="file_id", match=models.MatchValue(value=file_id))])))
+        
+        # 업데이트인 경우, 기존 데이터 먼저 삭제
+        if status.startswith("Update"):
+            logger.debug(f"기존 데이터 삭제 중: {file_name}")
+            qdrant_client.delete(
+                collection_name=COLLECTION_NAME,
+                points_selector=models.FilterSelector(filter=models.Filter(must=[models.FieldCondition(key="file_id", match=models.MatchValue(value=file_id))]))
+            )
+
         if points:
             qdrant_client.upsert(collection_name=COLLECTION_NAME, points=points, wait=True)
         processed_files += 1
 
-    logger.info("--- 삭제된 파일 확인 및 정리 시작 ---")
+    # Google Drive에서 삭제된 파일들을 Vector DB에서 제거
+    logger.info("삭제된 파일 확인 및 정리 시작...")
     qdrant_file_ids = set()
     next_offset = None
     while True:
@@ -320,7 +314,7 @@ def perform_sync():
             ))
         )
     
-    logger.info(f"--- 동기화 완료: 처리 {processed_files}개, 건너뜀 {skipped_files}개, 삭제 {len(ids_to_delete)}개 ---")
+    logger.info(f"--- 동기화 완료: 처리 {processed_files}개, 건너뜀 {skipped_files}개, 삭제 {len(ids_to_delete)}개 (Chunk Version: {CHUNK_VERSION}) ---")
 
 # --- 6. FastAPI 수명주기 (Lifespan) ---
 @asynccontextmanager
@@ -337,99 +331,80 @@ async def lifespan(app: FastAPI):
         raise RuntimeError("Embedding model initialization failed") from e
 
     client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
-    
     try:
-        # 컬렉션 정보를 가져오는 것을 시도합니다.
         info = client.get_collection(collection_name=COLLECTION_NAME)
-        
-        # [수정 1] 구버전/신버전 라이브러리 모두 호환되도록 벡터 크기 확인
-        # hasattr를 사용하여 안전하게 속성 존재 여부를 확인합니다.
-        current_vector_size = -1
-        if hasattr(info, 'vectors_config'): # 신버전 경로
-            current_vector_size = info.vectors_config.params.size
-        elif hasattr(info, 'config'): # 구버전 경로
-            current_vector_size = info.config.params.vectors.size
-
+        current_vector_size = info.vectors_config.params.size
         if current_vector_size != vector_size:
-            logger.warning("컬렉션의 벡터 차원이 모델과 달라 재생성합니다.")
-            # [수정 2] 버전 호환성을 위해 wait 인자 없이 호출
+            logger.warning(f"컬렉션의 벡터 차원({current_vector_size})이 모델({vector_size})과 달라 재생성합니다.")
             client.recreate_collection(
                 collection_name=COLLECTION_NAME,
                 vectors_config=models.VectorParams(size=vector_size, distance=models.Distance.COSINE)
             )
-
-    except Exception as e:
-        # get_collection이 404 에러 등을 포함한 예외를 발생시키면, 컬렉션이 없는 것으로 간주합니다.
-        if "404" in str(e) or "Not found" in str(e) or "doesn't exist" in str(e):
-             logger.info(f"컬렉션 '{COLLECTION_NAME}'을(를) 찾을 수 없어 새로 생성합니다.")
-        else:
-             logger.warning(f"컬렉션 확인 중 예외 발생({e}). 새로 생성합니다.")
-        
-        # [수정 2] 버전 호환성을 위해 wait 인자 없이 호출
+    except Exception:
+        logger.info(f"컬렉션 '{COLLECTION_NAME}'을(를) 새로 생성합니다.")
         client.recreate_collection(
             collection_name=COLLECTION_NAME,
             vectors_config=models.VectorParams(size=vector_size, distance=models.Distance.COSINE)
         )
 
-    # (이하 코드는 동일합니다)
     vectorstore = Qdrant(client=client, collection_name=COLLECTION_NAME, embeddings=embeddings)
-    llm = Ollama(model=LLM_MODEL, base_url=OLLAMA_BASE_URL)
-    retriever = vectorstore.as_retriever(
-        search_type="mmr", 
-        search_kwargs={
-            'k': 10,
-            'fetch_k': 20,
-            'lambda_mult': 0.7
-        }
-    )
-    # 한국어 응답을 위한 커스텀 체인 설정
-    from langchain.prompts import PromptTemplate
+    llm = OllamaLLM(model=LLM_MODEL, base_url=OLLAMA_BASE_URL)
     
+    # Excel 데이터에 최적화된 retriever 설정
+    retriever = vectorstore.as_retriever(
+        search_type="similarity", 
+        search_kwargs={'k': 12}  # 더 많은 컨텍스트 수집
+    )
+    
+    # Excel 문서 해석에 특화된 프롬프트
     custom_prompt = PromptTemplate(
-        template="""[지침사항]
-- 반드시 한국어로 답변하세요
-- 제공된 문서에서 정보를 찾아 정확하게 답변하세요
-- 정보가 없으면 "문서에서 관련 정보를 찾을 수 없습니다"라고 한국어로 답변하세요
+        template="""당신은 엑셀 문서를 분석하는 전문가입니다.
 
-[문서 내용]
+[중요 지침]
+1. 제공된 문서 내용만을 정확히 기반으로 답변하세요
+2. 셀 위치 정보 [행,열]을 참고하여 관련 데이터를 종합 분석하세요
+3. 프로젝트명, 담당자, 인력, 일정 등 구체적 정보를 정확히 인용하세요
+4. 여러 시트에 걸친 관련 정보가 있다면 모두 종합하여 완전한 답변을 제공하세요
+5. 베트남어나 기타 언어를 절대 사용하지 말고 오직 한국어로만 답변하세요
+6. 추측하지 말고 문서에 명확히 기록된 정보만 제공하세요
+
+[분석할 문서 내용]
 {context}
 
 [질문]
 {question}
 
-[답변]""",
+[정확한 한국어 답변]""",
         input_variables=["context", "question"]
     )
     
     qa_chain = RetrievalQA.from_chain_type(
-        llm=llm, 
-        chain_type="stuff", 
-        retriever=retriever,
+        llm=llm, chain_type="stuff", retriever=retriever,
         chain_type_kwargs={"prompt": custom_prompt}
     )
     logger.info("RAG 컴포넌트 초기화 완료.")
 
+    # 앱 시작 시 즉시 1회 동기화, 이후 주기적으로 동기화
     if not scheduler.running:
-        scheduler.add_job(perform_sync, 'interval', minutes=SYNC_INTERVAL_MINUTES, id="gdrive_sync_job", replace_existing=True)
-        scheduler.add_job(perform_sync, 'date', id="gdrive_initial_sync", replace_existing=True)
+        scheduler.add_job(perform_sync, 'date', id="gdrive_initial_sync")
+        scheduler.add_job(perform_sync, 'interval', minutes=SYNC_INTERVAL_MINUTES, id="gdrive_sync_job")
         scheduler.start()
-        logger.info(f"자동 동기화 스케줄러 시작. {SYNC_INTERVAL_MINUTES}분마다 실행됩니다.")
+        logger.info(f"자동 동기화 스케줄러 시작. 최초 실행 후 {SYNC_INTERVAL_MINUTES}분마다 실행됩니다.")
 
     yield
 
     logger.info("애플리케이션 종료...")
     if scheduler.running: scheduler.shutdown()
 
-
 # --- 7. FastAPI 앱 및 API ---
-app = FastAPI(title="Google Drive RAG Application", version="1.3.0-final", lifespan=lifespan)
+app = FastAPI(title="Google Drive RAG Application", version="1.5.0-fixed", lifespan=lifespan)
 
 class QueryRequest(BaseModel):
-    question: str = Field(..., min_length=5, title="질문", description="RAG 모델에게 할 질문 (최소 5자 이상)")
+    question: str = Field(..., min_length=3, title="질문", description="RAG 모델에게 할 질문")
 
 @app.get("/")
 async def root():
-    return {"message": "Google Drive RAG API가 실행 중입니다."}
+    return {"message": "Google Drive RAG API가 실행 중입니다. /docs 에서 API 문서를 확인하세요."}
 
 @app.post("/query")
 async def query_documents(req: QueryRequest):
@@ -438,7 +413,12 @@ async def query_documents(req: QueryRequest):
     try:
         question = req.question.strip()
         result = qa_chain.invoke({"query": question})
-        return {"question": question, "answer": result['result']}
+        
+        # 깔끔한 응답 (source_documents 배열 제거)
+        return {
+            "question": question, 
+            "answer": result['result'].strip()
+        }
     except Exception as e:
         logger.error(f"질문 처리 중 오류 발생: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="질문 처리 중 서버 오류가 발생했습니다.")
@@ -452,68 +432,10 @@ async def manual_sync(background_tasks: BackgroundTasks):
 async def health_check():
     return {
         "status": "healthy",
-        "drive_service": "connected" if get_drive_service() else "not_connected",
+        "drive_service": "connected" if drive_service else "not_connected",
         "rag_components_initialized": qa_chain is not None,
         "scheduler_running": scheduler.running if scheduler else False
     }
-
-@app.get("/debug/documents")
-async def debug_documents():
-    """저장된 문서들의 정보를 확인"""
-    if not vectorstore:
-        return {"error": "Vectorstore not initialized"}
-    
-    try:
-        client = vectorstore.client
-        # 모든 문서 정보 가져오기
-        points, _ = client.scroll(
-            collection_name=COLLECTION_NAME,
-            limit=50,
-            with_payload=True,
-            with_vectors=False
-        )
-        
-        documents = []
-        for point in points:
-            payload = point.payload
-            documents.append({
-                "source": payload.get("source", "Unknown"),
-                "file_id": payload.get("file_id", "Unknown"),
-                "content_preview": payload.get("page_content", "")[:200] + "..."
-            })
-        
-        return {
-            "total_documents": len(points),
-            "documents": documents
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.post("/debug/search")
-async def debug_search(req: QueryRequest):
-    """검색 결과를 디버그"""
-    if not vectorstore:
-        return {"error": "Vectorstore not initialized"}
-    
-    try:
-        # 직접 벡터 검색 실행
-        docs = vectorstore.similarity_search_with_score(req.question, k=10)
-        
-        results = []
-        for doc, score in docs:
-            results.append({
-                "score": float(score),
-                "source": doc.metadata.get("source", "Unknown"),
-                "content_preview": doc.page_content[:300] + "..."
-            })
-        
-        return {
-            "question": req.question,
-            "search_results": results
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
